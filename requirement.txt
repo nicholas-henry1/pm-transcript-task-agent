@@ -1,4 +1,0 @@
-functions-framework==3.*
-google-cloud-storage
-google-cloud-aiplatform
-asana>=5.0.0
