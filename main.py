@@ -18,12 +18,13 @@ GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "ascn-win-visit-3287-sbx")
 VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "us-central1")
 VERTEX_MODEL_NAME = os.environ.get("VERTEX_MODEL_NAME", "gemini-2.5-flash")
 
-ASANA_ACCESS_TOKEN = os.environ.get("ASANA_ACCESS_TOKEN")
-ASANA_WORKSPACE_GID = os.environ.get("ASANA_WORKSPACE_GID")
-ASANA_PROJECT_GID = os.environ.get("ASANA_PROJECT_GID")
+# Trello configuration
+TRELLO_API_KEY = os.environ.get("TRELLO_API_KEY")
+TRELLO_TOKEN = os.environ.get("TRELLO_TOKEN")
+TRELLO_LIST_ID = os.environ.get("TRELLO_LIST_ID")
 
-# Optional. If unset, uses "me".
-ASANA_ASSIGNEE = os.environ.get("ASANA_ASSIGNEE", "me")
+# Optional. If set, created cards will be assigned to this Trello member.
+TRELLO_MEMBER_ID = os.environ.get("TRELLO_MEMBER_ID")
 
 # Optional. Controls whether 25% confidence tasks are created.
 # Recommended: false for production, true while testing.
@@ -36,26 +37,6 @@ PROCESSED_MARKER_PREFIX = os.environ.get("PROCESSED_MARKER_PREFIX", "processed")
 
 # Optional. Guardrail for very large transcripts.
 MAX_TRANSCRIPT_CHARS = int(os.environ.get("MAX_TRANSCRIPT_CHARS", "150000"))
-
-
-# ---------------------------------------------------------------------
-# Asana custom field mapping
-# ---------------------------------------------------------------------
-
-PRIORITY_FIELD_GID = "1214848089610383"
-PRIORITY_OPTIONS = {
-    "low": "1214848089610384",
-    "medium": "1214848089610386",
-    "high": "1214848089610385",
-}
-
-CONFIDENCE_FIELD_GID = "1214848089610388"
-CONFIDENCE_OPTIONS = {
-    "100%": "1214848089610389",
-    "75%": "1214848089610392",
-    "50%": "1214848089610391",
-    "25%": "1214848089610390",
-}
 
 
 # ---------------------------------------------------------------------
@@ -155,7 +136,7 @@ For each task, return this exact JSON structure:
 
 [
   {{
-    "title": "Verb-led Asana task title under 120 characters",
+    "title": "Verb-led Trello card title under 120 characters",
     "description": "Brief explanation of the task and relevant context",
     "task_type": "follow_up | documentation | stakeholder_alignment | decision_needed | requirements | risk_or_blocker | delivery_coordination | leadership_update | other",
     "due_date": "YYYY-MM-DD or null",
@@ -185,7 +166,7 @@ Important rules:
 - Do not invent deadlines.
 - Do not invent tasks.
 - If a due date is not explicit or strongly implied, use null.
-- Keep task titles concise and Asana-ready.
+- Keep task titles concise and Trello-ready.
 - Make every task title start with a verb.
 
 Transcript:
@@ -221,7 +202,7 @@ def has_been_processed(bucket: storage.Bucket, file_name: str) -> bool:
 def mark_as_processed(
     bucket: storage.Bucket,
     file_name: str,
-    created_task_count: int,
+    created_card_count: int,
     extracted_task_count: int,
 ) -> None:
     marker_name = get_processed_marker_name(file_name)
@@ -229,7 +210,7 @@ def mark_as_processed(
 
     marker_payload = {
         "source_file": file_name,
-        "created_task_count": created_task_count,
+        "created_card_count": created_card_count,
         "extracted_task_count": extracted_task_count,
     }
 
@@ -241,8 +222,7 @@ def mark_as_processed(
 
 def normalize_due_date(value: Optional[str]) -> Optional[str]:
     """
-    Asana expects due_on in YYYY-MM-DD format.
-    The model should return null or YYYY-MM-DD, but this protects against empty strings.
+    Trello accepts due dates. This function protects against empty/null strings.
     """
     if not value:
         return None
@@ -257,7 +237,7 @@ def normalize_due_date(value: Optional[str]) -> Optional[str]:
 
 def validate_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Basic validation and cleanup before sending task to Asana.
+    Basic validation and cleanup before sending task to Trello.
     Returns cleaned task or None if invalid.
     """
     if not isinstance(task, dict):
@@ -284,7 +264,7 @@ def validate_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if confidence == "25%" and not INCLUDE_LOW_CONFIDENCE_TASKS:
         return None
 
-    # Keep Asana task names reasonably short.
+    # Keep Trello card names reasonably short.
     if len(title) > 120:
         title = title[:117].rstrip() + "..."
 
@@ -330,7 +310,7 @@ def extract_tasks_with_gemini(transcript_text: str) -> List[Dict[str, Any]]:
     return cleaned_tasks
 
 
-def build_asana_notes(task: Dict[str, Any], file_name: str) -> str:
+def build_trello_description(task: Dict[str, Any], file_name: str) -> str:
     return f"""
 Extracted from: {file_name}
 
@@ -344,72 +324,56 @@ Confidence: {task.get("confidence")}
 Source quote:
 {task.get("source_quote")}
 
-Why assigned to Nick:
+Why assigned to Nick/Product:
 {task.get("reason_assigned_to_nick")}
 """.strip()
 
 
-def create_asana_task(task: Dict[str, Any], file_name: str) -> None:
+def create_trello_card(task: Dict[str, Any], file_name: str) -> None:
     """
-    Creates a task in Asana using direct REST API.
+    Creates a Trello card using Trello's REST API.
 
-    This intentionally avoids raw f-string JSON construction so quotes,
-    newlines, and transcript content do not break the request body.
+    Required environment variables:
+    - TRELLO_API_KEY
+    - TRELLO_TOKEN
+    - TRELLO_LIST_ID
     """
-    priority = str(task.get("priority", "medium")).lower()
-    confidence = str(task.get("confidence", "50%"))
-
-    priority_gid = PRIORITY_OPTIONS.get(priority, PRIORITY_OPTIONS["medium"])
-    confidence_gid = CONFIDENCE_OPTIONS.get(confidence, CONFIDENCE_OPTIONS["50%"])
-
-    project_gid = str(ASANA_PROJECT_GID or "").strip()
-    workspace_gid = str(ASANA_WORKSPACE_GID or "").strip()
-    token = ASANA_ACCESS_TOKEN
-
-    if not token:
-        raise ValueError("ASANA_ACCESS_TOKEN is missing")
-    if not project_gid:
-        raise ValueError("ASANA_PROJECT_GID is missing")
-    if not workspace_gid:
-        raise ValueError("ASANA_WORKSPACE_GID is missing")
+    if not TRELLO_API_KEY:
+        raise ValueError("TRELLO_API_KEY is missing")
+    if not TRELLO_TOKEN:
+        raise ValueError("TRELLO_TOKEN is missing")
+    if not TRELLO_LIST_ID:
+        raise ValueError("TRELLO_LIST_ID is missing")
 
     payload = {
-        "data": {
-            "name": task["title"],
-            "projects": [project_gid],
-            "workspace": workspace_gid,
-            "assignee": ASANA_ASSIGNEE or "me",
-            "notes": build_asana_notes(task, file_name),
-            "custom_fields": {
-                PRIORITY_FIELD_GID: priority_gid,
-                CONFIDENCE_FIELD_GID: confidence_gid,
-            },
-        }
+        "key": TRELLO_API_KEY,
+        "token": TRELLO_TOKEN,
+        "idList": TRELLO_LIST_ID,
+        "name": task["title"],
+        "desc": build_trello_description(task, file_name),
+        "pos": "top",
     }
 
     due_date = task.get("due_date")
     if due_date:
-        payload["data"]["due_on"] = due_date
+        payload["due"] = due_date
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+    if TRELLO_MEMBER_ID:
+        payload["idMembers"] = TRELLO_MEMBER_ID
 
     response = requests.post(
-        "https://app.asana.com/api/1.0/tasks",
-        json=payload,
-        headers=headers,
+        "https://api.trello.com/1/cards",
+        data=payload,
         timeout=30,
     )
 
     if response.status_code not in (200, 201):
         raise RuntimeError(
-            f"Asana task creation failed with {response.status_code}: {response.text}"
+            f"Trello card creation failed with {response.status_code}: {response.text}"
         )
 
-    print(f"Created Asana task: {task['title']}")
+    card = response.json()
+    print(f"Created Trello card: {card.get('name')} ({card.get('shortUrl')})")
 
 
 # ---------------------------------------------------------------------
@@ -418,6 +382,13 @@ def create_asana_task(task: Dict[str, Any], file_name: str) -> None:
 
 @functions_framework.cloud_event
 def process_transcript_for_asana_tasks(cloud_event):
+    """
+    Cloud Function entrypoint.
+
+    Note: The function name still says "asana" so your existing deploy command
+    can keep using --entry-point=process_transcript_for_asana_tasks.
+    The implementation now creates Trello cards.
+    """
     data = cloud_event.data
 
     bucket_name = data.get("bucket")
@@ -440,7 +411,7 @@ def process_transcript_for_asana_tasks(cloud_event):
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
 
-    # Idempotency check. Avoid duplicate Asana tasks if the same file event retries.
+    # Idempotency check. Avoid duplicate Trello cards if the same file event retries.
     if has_been_processed(bucket, file_name):
         print(f"Skipping already processed file: {file_name}")
         return "Already processed"
@@ -462,7 +433,7 @@ def process_transcript_for_asana_tasks(cloud_event):
         mark_as_processed(
             bucket=bucket,
             file_name=file_name,
-            created_task_count=0,
+            created_card_count=0,
             extracted_task_count=0,
         )
         return "Empty transcript"
@@ -487,7 +458,7 @@ def process_transcript_for_asana_tasks(cloud_event):
         mark_as_processed(
             bucket=bucket,
             file_name=file_name,
-            created_task_count=0,
+            created_card_count=0,
             extracted_task_count=0,
         )
         return "No tasks"
@@ -496,21 +467,21 @@ def process_transcript_for_asana_tasks(cloud_event):
 
     for task in extracted_tasks:
         try:
-            create_asana_task(
+            create_trello_card(
                 task=task,
                 file_name=file_name,
             )
             created_count += 1
         except Exception as exc:
-            print(f"Unexpected error while creating task '{task['title']}': {exc}")
+            print(f"Unexpected error while creating Trello card '{task['title']}': {exc}")
             raise
 
     mark_as_processed(
         bucket=bucket,
         file_name=file_name,
-        created_task_count=created_count,
+        created_card_count=created_count,
         extracted_task_count=len(extracted_tasks),
     )
 
-    print(f"Successfully created {created_count} Asana task(s).")
-    return f"Created {created_count} task(s)"
+    print(f"Successfully created {created_count} Trello card(s).")
+    return f"Created {created_count} card(s)"
