@@ -1,4 +1,4 @@
-functions-framework==3.*
+functions-framework
 google-cloud-storage
 google-cloud-aiplatform
-asana>=5.0.0
+requests
