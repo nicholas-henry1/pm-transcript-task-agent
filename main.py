@@ -1,6 +1,7 @@
 import json
 import os
 import hashlib
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -283,31 +284,51 @@ def validate_task(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def extract_tasks_with_gemini(transcript_text: str) -> List[Dict[str, Any]]:
     prompt = build_prompt(transcript_text)
 
-    response = model.generate_content(
-        prompt,
-        generation_config=GENERATION_CONFIG,
+    max_attempts = 3
+    last_exception = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"Calling Gemini for task extraction. Attempt {attempt}/{max_attempts}.")
+
+            response = model.generate_content(
+                prompt,
+                generation_config=GENERATION_CONFIG,
+            )
+
+            raw_text = response.text or "[]"
+
+            try:
+                parsed = json.loads(raw_text)
+            except json.JSONDecodeError as exc:
+                print(f"Invalid JSON returned by Gemini: {raw_text}")
+                raise ValueError("Gemini returned invalid JSON") from exc
+
+            if not isinstance(parsed, list):
+                print(f"Expected JSON array from Gemini, got: {type(parsed)}")
+                raise ValueError("Gemini returned non-array JSON")
+
+            cleaned_tasks = []
+
+            for item in parsed:
+                cleaned_task = validate_task(item)
+                if cleaned_task:
+                    cleaned_tasks.append(cleaned_task)
+
+            return cleaned_tasks
+
+        except Exception as exc:
+            last_exception = exc
+            print(f"Gemini extraction attempt {attempt} failed: {exc}")
+
+            if attempt < max_attempts:
+                sleep_seconds = attempt * 5
+                print(f"Retrying Gemini extraction in {sleep_seconds} seconds.")
+                time.sleep(sleep_seconds)
+
+    raise RuntimeError(
+        f"Gemini task extraction failed after {max_attempts} attempts: {last_exception}"
     )
-
-    raw_text = response.text or "[]"
-
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        print(f"Invalid JSON returned by Gemini: {raw_text}")
-        raise ValueError("Gemini returned invalid JSON") from exc
-
-    if not isinstance(parsed, list):
-        print(f"Expected JSON array from Gemini, got: {type(parsed)}")
-        raise ValueError("Gemini returned non-array JSON")
-
-    cleaned_tasks = []
-
-    for item in parsed:
-        cleaned_task = validate_task(item)
-        if cleaned_task:
-            cleaned_tasks.append(cleaned_task)
-
-    return cleaned_tasks
 
 
 def build_trello_description(task: Dict[str, Any], file_name: str) -> str:
